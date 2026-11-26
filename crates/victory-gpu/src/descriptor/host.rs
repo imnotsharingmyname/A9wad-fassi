@@ -1121,21 +1121,46 @@ impl TextureQueue {
     /// What [`TextureQueue::due`] says of `due` (with nothing held: some
     /// ten thousand slots are sorted).
     fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
-        // By the number of the write, counted over the run.
+        if max == 0 {
+            return Vec::new();
+        }
+        // Write numbers are unique within the queue. Select only the
+        // prefix the pass can use, rather than sorting the whole backlog.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let take = (max - order.len()).min(fresh.len());
+        if take == 0 {
+            return order;
+        }
+        // Fresh entries alternate between the newest and oldest writes.
+        // Keep disjoint ends of exactly the required sizes, and leave
+        // the unserved middle unsorted.
+        let new_count = take.div_ceil(2);
+        let old_count = take / 2;
+        if new_count < fresh.len() {
+            fresh.select_nth_unstable_by(new_count, newest_first);
+        }
+        let (newest, rest) = fresh.split_at_mut(new_count);
+        let old_start = rest.len() - old_count;
+        if old_count != 0 && old_start != 0 {
+            rest.select_nth_unstable_by(old_start, newest_first);
+        }
+        let oldest = &mut rest[old_start..];
+        newest.sort_unstable_by(newest_first);
+        oldest.sort_unstable_by(newest_first);
+        order.reserve(take);
+        let mut oldest = oldest.iter().rev();
+        for &(_, index, write) in newest.iter() {
+            order.push((index, write));
+            if let Some(&(_, index, write)) = oldest.next() {
+                order.push((index, write));
             }
         }
-        order.truncate(max);
         order
     }
 
@@ -5581,6 +5606,40 @@ mod tests {
             assert_ne!(copy.span().0, start + off, "its buffer's copy");
             // SAFETY: a live buffer.
             assert_eq!(width(&v), unsafe { copy.buffer.GetDesc() }.Width);
+        }
+    }
+
+    #[test]
+    fn limited_texture_order_matches_full_sort() {
+        // Distinct write numbers in deliberately scrambled slot order.
+        // Compare every limit, including zero and larger than the queue,
+        // for mixed, empty, all-fresh and all-retry backlogs.
+        for retry in 0..=23u32 {
+            let mut due: super::Due = Default::default();
+            for i in 0..23u32 {
+                let write = u64::from((i * 11) % 23 + 1);
+                due[usize::from(i >= retry)].push((0, i, write));
+            }
+            let [mut again, mut fresh] = due.clone();
+            again.sort_unstable_by_key(|x| std::cmp::Reverse(x.2));
+            fresh.sort_unstable_by_key(|x| std::cmp::Reverse(x.2));
+            let mut expected: Vec<_> = again.iter().map(|&(_, i, w)| (i, w)).collect();
+            let (mut new, mut old) = (0, fresh.len());
+            while new < old {
+                expected.push((fresh[new].1, fresh[new].2));
+                new += 1;
+                if new < old {
+                    old -= 1;
+                    expected.push((fresh[old].1, fresh[old].2));
+                }
+            }
+            for max in 0..=25 {
+                assert_eq!(
+                    TextureQueue::in_order(due.clone(), max),
+                    expected[..expected.len().min(max)],
+                    "retry={retry}, max={max}"
+                );
+            }
         }
     }
 
